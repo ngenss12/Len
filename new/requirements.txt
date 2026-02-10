@@ -1,0 +1,11 @@
+numpy
+torch
+torchvision
+scikit-learn
+tifffile
+pandas
+joblib
+scikit-image
+scipy
+matplotlib
+seaborn
