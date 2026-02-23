@@ -4,6 +4,13 @@ from torch.utils.data import Subset
 from sklearn.model_selection import train_test_split
 from collections import Counter
 
+def _to_int_label(x):
+    if isinstance(x, torch.Tensor):
+        return int(x.item())
+    if isinstance(x, np.generic):
+        return int(x)
+    return int(x)
+
 def stratified_train_val_split(dataset, labels, train_size=0.8, random_state=42):
     """
     Perform stratified train-validation split
@@ -19,6 +26,8 @@ def stratified_train_val_split(dataset, labels, train_size=0.8, random_state=42)
     # Get all indices and labels
     indices = np.arange(len(dataset))
     
+    labels = np.array([_to_int_label(l) for l in labels], dtype=np.int64)
+
     # Perform stratified split
     train_indices, val_indices = train_test_split(
         indices,
@@ -36,8 +45,8 @@ def stratified_train_val_split(dataset, labels, train_size=0.8, random_state=42)
     print("STRATIFIED SPLIT STATISTICS")
     print("="*60)
     
-    train_labels = [dataset[i]['label'] for i in train_indices]
-    val_labels = [dataset[i]['label'] for i in val_indices]
+    train_labels = [_to_int_label(dataset[i]['label']) for i in train_indices]
+    val_labels = [_to_int_label(dataset[i]['label']) for i in val_indices]
     
     class_names = ['Bulk Carrier', 'Container Ship', 'Fishing', 'Tanker']
     

@@ -3,6 +3,7 @@
 import random
 import pandas as pd
 import numpy as np
+import torch
 import tifffile as tiff
 import joblib
 import os
@@ -15,6 +16,20 @@ from skimage.transform import resize
 
 random.seed(42)
 
+def _to_numpy_hwc(image):
+    """Convert image tensor/array to numpy HWC for numpy augment ops + tifffile write."""
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+    image = np.asarray(image)
+    if image.ndim == 3 and image.shape[0] in (1, 2, 3, 4):
+        image = np.transpose(image, (1, 2, 0))
+    return image.astype(np.float32, copy=False)
+
+def _to_float_list(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=np.float32).tolist()
+
 def create_balanced_dataset(dataset, target=-1, is_augmented=False):
     """
     Balance dataset by augmentation
@@ -26,14 +41,20 @@ def create_balanced_dataset(dataset, target=-1, is_augmented=False):
         augmentation: ShipAugmentation instance (if None, will create one)
     """
     augmentation = ShipAugmentation()
-    aug_combinations = augmentation.get_all_combinations()
+    aug_names = list(augmentation.augmentations.keys())
     
     # Get class distribution
-    labels = [dataset[i]['label'] for i in range(len(dataset))]
+    labels = []
+    for i in range(len(dataset)):
+        lb = dataset[i]['label']
+        # Subset can return torch scalar tensor; normalize to plain int
+        if hasattr(lb, "item"):
+            lb = lb.item()
+        labels.append(int(lb))
     class_indices = {i: [] for i in range(4)}
     
     for idx, label in enumerate(labels):
-        class_indices[label].append(idx)
+        class_indices[int(label)].append(idx)
     
     # Store augmented samples
     final = []
@@ -46,44 +67,45 @@ def create_balanced_dataset(dataset, target=-1, is_augmented=False):
                 for idx in indices:
                     row = dataset[idx]
                     final.append({
-                        'label': row['label'],
-                        'rt': row['rt'],
+                        'label': int(row['label'].item() if hasattr(row['label'], "item") else row['label']),
+                        'rt': _to_float_list(row['rt']),
                         'img_path': row['img_path'],
                     })
                 continue
 
-            # Amount of augmentation needed
-            n_augment = target - current_count
-
-            # Count how many augmentations to reach required amount for each sample
-            n_per_sample = n_augment // current_count + 1
-
+            # Keep originals first
             for i in indices:
-                # Pick a random sample from this class
-                original_sample = dataset[i]
+                row = dataset[i]
                 final.append({
-                    'img_path': original_sample['img_path'],
-                    'label': original_sample['label'],
-                    'rt': original_sample['rt'],
+                    'img_path': row['img_path'],
+                    'label': int(row['label'].item() if hasattr(row['label'], "item") else row['label']),
+                    'rt': _to_float_list(row['rt']),
                 })
-                original_img = original_sample['image']
 
-                for augs in aug_combinations[:n_per_sample]:
-                    if n_augment <= 0:
-                        break
-                    
-                    augmented_img = augmentation.apply_augmentations(original_img, augs)
-                    filename = f'augment/{"_".join(augs)}_{Path(original_sample["img_path"]).name}'
-                    try:
-                        tiff.imwrite(filename, augmented_img)
-                        final.append({
-                            'label': original_sample['label'],
-                            'rt': original_sample['rt'],
-                            'img_path': filename,
-                        })
-                        n_augment -= 1
-                    except Exception as e:
-                        print(f"Error saving image {filename}: {e}")
+            # Conservative augmentation: one random transform per synthetic sample.
+            n_augment = target - current_count
+            ptr = 0
+            while n_augment > 0:
+                i = indices[ptr % current_count]
+                original_sample = dataset[i]
+                original_img = _to_numpy_hwc(original_sample['image'])
+
+                aug_name = random.choice(aug_names)
+                augmented_img = augmentation.apply_augmentations(original_img, [aug_name])
+                stem = Path(original_sample["img_path"]).stem
+                suffix = Path(original_sample["img_path"]).suffix
+                filename = f"augment/{aug_name}_{ptr}_{stem}{suffix}"
+                try:
+                    tiff.imwrite(filename, np.asarray(augmented_img, dtype=np.float32))
+                    final.append({
+                        'label': int(original_sample['label'].item() if hasattr(original_sample['label'], "item") else original_sample['label']),
+                        'rt': _to_float_list(original_sample['rt']),
+                        'img_path': filename,
+                    })
+                    n_augment -= 1
+                except Exception as e:
+                    print(f"Error saving image {filename}: {e}")
+                ptr += 1
         else:
             if target == -1:
                 target = current_count
@@ -94,8 +116,8 @@ def create_balanced_dataset(dataset, target=-1, is_augmented=False):
             for idx in undersampled_indices:
                 row = dataset[idx]
                 final.append({
-                    'label': row['label'],
-                    'rt': row['rt'],
+                    'label': int(row['label'].item() if hasattr(row['label'], "item") else row['label']),
+                    'rt': _to_float_list(row['rt']),
                     'img_path': row['img_path'],
                 })
 
@@ -121,10 +143,22 @@ def calculate_global_stats(dataset):
 
 # Preprocess dataset
 os.makedirs("resized_new", exist_ok=True)
+os.makedirs("augment", exist_ok=True)
 os.makedirs("final/train", exist_ok=True)
 os.makedirs("final/val", exist_ok=True)
 os.makedirs("final/test", exist_ok=True)
-for file_path in Path("new/PATCH_CAL").iterdir():
+base_dir = Path(__file__).resolve().parent
+patch_cal_dir = base_dir / "PATCH_CAL"
+if not patch_cal_dir.exists():
+    alt_patch_cal_dir = base_dir / "data gambar" / "PATCH_CAL"
+    if alt_patch_cal_dir.exists():
+        patch_cal_dir = alt_patch_cal_dir
+    else:
+        raise FileNotFoundError(
+            f"PATCH_CAL folder not found. Checked: {patch_cal_dir} and {alt_patch_cal_dir}"
+        )
+
+for file_path in patch_cal_dir.iterdir():
     img = tiff.imread(file_path).astype(np.float32)
     img_resized = resize(img, (64, 64), order=3, mode='reflect', preserve_range=True)
     if (img_resized.shape != (64, 64, 2)):
@@ -134,9 +168,7 @@ for file_path in Path("new/PATCH_CAL").iterdir():
 
 
 print("\nLoading datasets...")
-dataset = OpenSARShipDataset(
-    root_dir="new",
-)
+dataset = OpenSARShipDataset(root_dir=str(base_dir))
 
 # 2. Stratified train-val split
 temp_subset, val_subset = stratified_train_val_split(dataset, labels=dataset.get_labels(), train_size=0.8)
