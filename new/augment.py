@@ -29,6 +29,7 @@ class ShipAugmentation:
         }
     def apply_augmentations(self, image, aug_list):
         """Apply a list of augmentations in sequence"""
+        image = np.asarray(image)
         for aug_name in aug_list:
             image = self.augmentations[aug_name](image)
         return image

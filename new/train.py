@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import copy
+import time
 from sklearn.metrics import (
     f1_score, 
     precision_score, 
@@ -53,21 +55,48 @@ class MacroF1Loss(nn.Module):
         # Return 1 - F1 (we minimize loss, so we want to minimize 1-F1)
         return 1 - macro_f1
 
-def train_model(model, train_loader, val_loader, device, epochs=70, initial_lr=0.001):
+def _extract_labels_from_loader(loader):
+    ds = loader.dataset
+    # FinalDataset has a dataframe with `label` column.
+    if hasattr(ds, "data") and "label" in getattr(ds, "data", {}).columns:
+        return ds.data["label"].astype(int).to_numpy()
+    # Fallback: read labels from batches.
+    all_labels = []
+    for batch in loader:
+        all_labels.extend(batch["label"].cpu().numpy().tolist())
+    return np.array(all_labels, dtype=np.int64)
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs=70,
+    initial_lr=0.001,
+    early_stop_patience=0,
+    f1_loss_weight=0.1,
+    previous_best_val_f1=0.0,
+):
     """
     Training setup as per Section 3.4
     """
     
-    # Loss function
-    criterion = MacroF1Loss(num_classes=4)
+    device = torch.device(device)
+    use_cuda = device.type == "cuda"
+    model = model.to(device)
+
+    # Conservative setup: CE-dominant objective to avoid unstable class bias.
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.02)
+    criterion_f1 = MacroF1Loss(num_classes=4)
     
     # Adam optimizer
-    optimizer = optim.Adam(model.parameters(), lr=initial_lr)
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4)
     
     # Learning rate scheduler (reduce when plateau)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.01, patience=5, 
-        min_lr=0.00001
+        optimizer, mode='max', factor=0.5, patience=4,
+        min_lr=1e-6
     )
     
     # Training history
@@ -80,13 +109,16 @@ def train_model(model, train_loader, val_loader, device, epochs=70, initial_lr=0
         'val_f1': [],
         'val_balanced_acc': [],
         'val_precision': [],
-        'val_recall': []
+        'val_recall': [],
+        'epoch_time_sec': []
     }
     
-    best_val_f1 = 0.0  # Track F1 instead of accuracy
-    best_model_state = None
+    best_val_f1 = float(previous_best_val_f1)  
+    best_model_state = copy.deepcopy(model.state_dict())
+    no_improve = 0
     
     for epoch in range(epochs):
+        epoch_start = time.time()
         print(f'\nEpoch {epoch+1}/{epochs}')
         print('-' * 50)
         
@@ -97,14 +129,19 @@ def train_model(model, train_loader, val_loader, device, epochs=70, initial_lr=0
         train_labels = []
         
         for batch_idx, batch in enumerate(train_loader):
-            images = batch['image'].to(device)
-            rt = batch['rt'].to(device)
-            labels = batch['label'].to(device)
+            images = batch['image'].to(device, non_blocking=use_cuda)
+            rt = batch['rt'].to(device, non_blocking=use_cuda)
+            labels = batch['label'].to(device, non_blocking=use_cuda)
             
             # Forward pass
             optimizer.zero_grad()
             outputs = model(images, rt)
-            loss = criterion(outputs, labels)
+            loss_ce = criterion_ce(outputs, labels)
+            if f1_loss_weight > 0:
+                loss_f1 = criterion_f1(outputs, labels)
+                loss = (1.0 - f1_loss_weight) * loss_ce + f1_loss_weight * loss_f1
+            else:
+                loss = loss_ce
             
             # Backward pass
             loss.backward()
@@ -140,12 +177,17 @@ def train_model(model, train_loader, val_loader, device, epochs=70, initial_lr=0
         
         with torch.no_grad():
             for batch in val_loader:
-                images = batch['image'].to(device)
-                rt = batch['rt'].to(device)
-                labels = batch['label'].to(device)
+                images = batch['image'].to(device, non_blocking=use_cuda)
+                rt = batch['rt'].to(device, non_blocking=use_cuda)
+                labels = batch['label'].to(device, non_blocking=use_cuda)
                 
                 outputs = model(images, rt)
-                loss = criterion(outputs, labels)
+                loss_ce = criterion_ce(outputs, labels)
+                if f1_loss_weight > 0:
+                    loss_f1 = criterion_f1(outputs, labels)
+                    loss = (1.0 - f1_loss_weight) * loss_ce + f1_loss_weight * loss_f1
+                else:
+                    loss = loss_ce
                 
                 val_loss += loss.item()
                 _, predicted = outputs.max(1)
@@ -174,18 +216,32 @@ def train_model(model, train_loader, val_loader, device, epochs=70, initial_lr=0
         history['val_balanced_acc'].append(val_balanced_acc)
         history['val_precision'].append(val_precision)
         history['val_recall'].append(val_recall)
+        epoch_time = time.time() - epoch_start
+        history['epoch_time_sec'].append(epoch_time)
         
         print(f'\nTraining   - Loss: {train_loss:.4f} | Acc: {train_acc:.2f}% | F1: {train_f1:.2f}%')
         print(f'Validation - Loss: {val_loss:.4f} | Acc: {val_acc:.2f}% | F1: {val_f1:.2f}%')
         print(f'           - Balanced Acc: {val_balanced_acc:.2f}% | Precision: {val_precision:.2f}% | Recall: {val_recall:.2f}%')
+        print(f'           - Epoch time: {epoch_time:.2f}s')
         
         # Save best model based on F1-score
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            best_model_state = model.state_dict().copy()
-            print(f'New best model! Val F1: {val_f1:.2f}%')
+            best_model_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+            print(f'New best model! Val F1: {val_f1:.2f}% (prev best: {previous_best_val_f1:.2f}%)')
+        else:
+            no_improve += 1
+            if early_stop_patience and early_stop_patience > 0:
+                print(f'No improvement count: {no_improve}/{early_stop_patience}')
+
+        if early_stop_patience and early_stop_patience > 0 and no_improve >= early_stop_patience:
+            print(f"Early stopping triggered (no val_f1 improvement for {early_stop_patience} epochs).")
+            break
     
     # Load best model
-    model.load_state_dict(best_model_state)
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    print(f'Final selected best Val F1 thresholded by previous best: {best_val_f1:.2f}%')
     
     return model, history

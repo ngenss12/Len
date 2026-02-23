@@ -8,7 +8,7 @@ from model import ResNet50WithRT
 def load_model(checkpoint_path, device, rt_dim=8, num_classes=4, pretrained=False):
     model = ResNet50WithRT(rt_dim=rt_dim, num_classes=num_classes, pretrained=pretrained)
     if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state, strict=True)
     model.to(device)
@@ -24,6 +24,7 @@ def export_onnx(
     image_size=64,
     rt_dim=8,
     num_classes=4,
+    dynamo=False,
 ):
     model = load_model(checkpoint_path, device, rt_dim=rt_dim, num_classes=num_classes)
 
@@ -38,7 +39,7 @@ def export_onnx(
         (dummy_image, dummy_rt),
         str(output_path),
         export_params=True,
-        opset_version=17,
+        opset_version=18,
         do_constant_folding=True,
         input_names=["image", "rt"],
         output_names=["logits"],
@@ -47,6 +48,7 @@ def export_onnx(
             "rt": {0: "batch"},
             "logits": {0: "batch"},
         },
+        dynamo=dynamo,
     )
 
 
@@ -59,6 +61,7 @@ def main():
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--rt-dim", type=int, default=8)
     parser.add_argument("--num-classes", type=int, default=4)
+    parser.add_argument("--dynamo", action="store_true", default=False, help="Use torch.export-based ONNX exporter")
     args = parser.parse_args()
 
     export_onnx(
@@ -69,6 +72,7 @@ def main():
         image_size=args.image_size,
         rt_dim=args.rt_dim,
         num_classes=args.num_classes,
+        dynamo=args.dynamo,
     )
 
 
