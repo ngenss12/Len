@@ -1,6 +1,8 @@
 import torch
 import os
+import random
 import json
+import numpy as np
 import matplotlib.pyplot as plt
 from model import ResNet50WithRT
 from dataload import FinalDataset
@@ -8,6 +10,22 @@ from torch.utils.data import DataLoader
 from train import train_model
 from metrics import evaluate_model, print_results, plot_confusion_matrix
 from datetime import datetime
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 def _make_unique_dir(path):
     if not os.path.exists(path):
@@ -83,7 +101,8 @@ def main():
         device = torch.device("cpu")
 
     config = {
-        'epochs': int(os.getenv("EPOCHS", "100")),
+        'seed': int(os.getenv("SEED", "42")),
+        'epochs': int(os.getenv("EPOCHS", "250")),
         'learning_rate': float(os.getenv("LR", "0.0001")),
         'early_stop_patience': int(os.getenv("EARLY_STOP_PATIENCE", "0")),
         'f1_loss_weight': float(os.getenv("F1_LOSS_WEIGHT", "0.0")),
@@ -94,6 +113,8 @@ def main():
         'gpu_id': gpu_id,
         'resume_from': os.getenv("RESUME_FROM", "").strip(),
     }
+
+    seed_everything(config['seed'])
     previous_best_val_f1 = 0.0
 
     model_type = 'resnet50'
@@ -119,12 +140,16 @@ def main():
     val_balanced = FinalDataset(csv_path="final/val.csv")
 
     # Create data loaders
+    g = torch.Generator()
+    g.manual_seed(config['seed'])
     train_loader = DataLoader(
         train_balanced,
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=config['num_workers'],
-        pin_memory=use_cuda
+        pin_memory=use_cuda,
+        worker_init_fn=_seed_worker,
+        generator=g,
     )
 
     val_loader = DataLoader(
@@ -132,7 +157,8 @@ def main():
         batch_size=config['batch_size'],
         shuffle=False,
         num_workers=config['num_workers'],
-        pin_memory=use_cuda
+        pin_memory=use_cuda,
+        worker_init_fn=_seed_worker,
     )
 
     # 5. Build model
